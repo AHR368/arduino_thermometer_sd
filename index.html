@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Arduino Serial → Chill XLSX exporter</title>
+
+<!-- SheetJS (xlsx) - used to build .xlsx in-browser -->
+<script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+
+<style>
+  body{font-family:system-ui,Helvetica,Arial;margin:18px}
+  button{margin:6px}
+  table{border-collapse:collapse;margin-top:12px;width:100%}
+  th,td{border:1px solid #ddd;padding:6px;text-align:left;font-size:13px}
+  .small{font-size:12px;color:#666}
+  #log{height:120px;overflow:auto;border:1px solid #ddd;padding:8px;margin-top:8px;white-space:pre-wrap;background:#fafafa}
+</style>
+</head>
+<body>
+<h2>Arduino Serial → Excel (.xlsx) — Utah + Dynamic</h2>
+
+<div>
+  <button id="connectBtn">Connect (Web Serial)</button>
+  <button id="disconnectBtn" disabled>Disconnect</button>
+  <button id="exportBtn" disabled>Export XLSX</button>
+  <span class="small">Auto-sends 'l' once after connect. Baud: 9600</span>
+</div>
+
+<div id="status" class="small">Status: idle</div>
+
+<div id="log"></div>
+
+<table id="dataTable" aria-label="data table">
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Timestamp</th>
+      <th>Temp °C</th>
+      <th>Humidity %</th>
+      <th>Utah CU (per-row formula)</th>
+      <th>Utah cum. (formula)</th>
+      <th>Dynamic CP (approx, JS)</th>
+      <th>Dynamic cum. (formula)</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+/*
+  App behavior summary:
+  - opens serial at 9600. After port opened, writes 'l' once (one byte)
+  - reads incoming text lines, robust regex extraction of timestamp, temp, humidity
+  - keeps rows array. Each row -> table row.
+  - Export: uses SheetJS to create workbook. Utah per-row set as Excel formula (cell.f)
+            cumulative Utah as SUM(cellrange) formula; dynamic per-row values written
+            as numbers; dynamic cumulative is formula SUM(G$2:Gn).
+  - Utah formula uses Celsius ranges converted from the classic Utah (F-based) table.
+*/
+
+const connectBtn = document.getElementById('connectBtn');
+const disconnectBtn = document.getElementById('disconnectBtn');
+const exportBtn = document.getElementById('exportBtn');
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const tbody = document.querySelector('#dataTable tbody');
+
+let port = null;
+let reader = null;
+let inputDone = null;
+let keepReading = true;
+let rows = []; // {timestamp, temp, hum, dynamicPortions}
+let dynamicState = {bucket:0, portions:0}; // simple two-step state
+
+function log(...args){
+  logEl.textContent += args.join(' ') + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// robust parser for lines similar to samples you gave
+function parseLine(line){
+  // attempt to find an ISO-ish timestamp: YYYY-M-D H:M:S
+  const tsMatch = line.match(/(\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{1,2}:\d{1,2})/);
+  let timestamp = tsMatch ? tsMatch[1] : (new Date()).toISOString();
+  // temperature: find number (with dot) before '°' or after 'Temp' etc.
+  const tempMatch = line.match(/Temp[:\s]*([+-]?\d+(?:\.\d+)?)/i) || line.match(/([+-]?\d+(?:\.\d+)?)\s*°\s*C/i);
+  const humMatch = line.match(/Humidity[:\s]*([+-]?\d+(?:\.\d+)?)/i) || line.match(/([+-]?\d+(?:\.\d+)?)\s*%/);
+  const temp = tempMatch ? parseFloat(tempMatch[1]) : NaN;
+  const hum = humMatch ? parseFloat(humMatch[1]) : NaN;
+  return {timestamp, temp, hum};
+}
+
+// Utah per-row formula generator (Excel formula string) using Celsius breakpoints
+// We'll use cell reference like C2 for temperature in the generated sheet
+function utahFormulaForCell(tempCellRef){
+  // boundaries in °C converted from Richardson (°F): 34,36,48,54,60,65 -> decimals
+  // 34°F -> 1.111°C, 36°F -> 2.222°C, 48°F -> 8.889°C, 54°F -> 12.222°C, 60°F -> 15.556°C, 65°F -> 18.333°C
+  // weights: <1.111 => 0
+  // 1.111-2.222 => 0.5
+  // 2.222-8.889 => 1
+  // 8.889-12.222 => 0.5
+  // 12.222-15.556 => 0
+  // 15.556-18.333 => -0.5
+  // >18.333 => -1
+  return `=IF(${tempCellRef}<1.111,0,IF(${tempCellRef}<2.222,0.5,IF(${tempCellRef}<8.889,1,IF(${tempCellRef}<12.222,0.5,IF(${tempCellRef}<15.556,0,IF(${tempCellRef}<18.333,-0.5,-1))))))`;
+}
+
+// Dynamic model (approximation):
+// - intermediate product is a bell-shaped response with peak at 6°C, zero outside [-2,14].
+// - we increment an internal bucket by 'intermediate' for each reading (assume reading ~hour; but user readings are frequent
+//   — this implementation treats each reading as a small time-step; it's a heuristic).
+// - when bucket >= 1.0, increment chill portions by 1 and reduce bucket by 1.
+// - warm temps reduce bucket gradually.
+// This follows the conceptual two-step description of the Dynamic model (Fishman/Erez).
+function dynamicStep(tempC){
+  // intermediate: gaussian-like centered at 6°C, zero outside [-2,14]
+  if (tempC === null || isNaN(tempC)) return {delta:0, portions: dynamicState.portions};
+  if (tempC < -2 || tempC > 14){
+    // outside effective zone; intermediate = 0
+  }
+  let intermediate = 0;
+  if (tempC >= -2 && tempC <= 14){
+    const sigma = 3.0; // shape parameter (tunable)
+    intermediate = Math.exp(-Math.pow(tempC - 6.0, 2) / (2 * sigma * sigma));
+    // scale to a smaller step because readings may be sub-hourly; choose small factor
+    intermediate *= 0.1; // tuning: treat reading as ~0.1 of an "hour-step"
+  }
+  // apply intermediate to bucket
+  dynamicState.bucket += intermediate;
+  // warm temperatures cause partial destruction of bucket
+  if (tempC > 12){
+    dynamicState.bucket *= 0.85; // warm reduction factor (tunable)
+  }
+  // bank chill portions when bucket crosses threshold 1.0
+  while (dynamicState.bucket >= 1.0){
+    dynamicState.portions += 1;
+    dynamicState.bucket -= 1.0;
+  }
+  return {delta: intermediate, portions: dynamicState.portions, bucket: dynamicState.bucket};
+}
+
+function addRowToTable(obj){
+  const idx = rows.length + 1;
+  const tr = document.createElement('tr');
+  const tdIndex = document.createElement('td'); tdIndex.textContent = idx;
+  const tdTs = document.createElement('td'); tdTs.textContent = obj.timestamp;
+  const tdT = document.createElement('td'); tdT.textContent = isNaN(obj.temp) ? '' : obj.temp.toFixed(2);
+  const tdH = document.createElement('td'); tdH.textContent = isNaN(obj.hum) ? '' : obj.hum.toFixed(2);
+  const tdUtah = document.createElement('td'); tdUtah.textContent = 'formula';
+  const tdUtahCum = document.createElement('td'); tdUtahCum.textContent = 'formula';
+  const tdDyn = document.createElement('td'); tdDyn.textContent = obj.dynamicPortions.toFixed(3);
+  const tdDynCum = document.createElement('td'); tdDynCum.textContent = 'formula';
+
+  tr.append(tdIndex, tdTs, tdT, tdH, tdUtah, tdUtahCum, tdDyn, tdDynCum);
+  tbody.appendChild(tr);
+}
+
+// Create workbook and attach formulas/values
+function exportXLSX(){
+  if (rows.length === 0) { alert('No data'); return; }
+  const wb = XLSX.utils.book_new();
+  // header row
+  const wsRows = [
+    ['#','Timestamp','Temp °C','Humidity %','Utah_CU','Utah_cum','Dynamic_CP_approx','Dynamic_cum']
+  ];
+  // create rows; but for Utah_CU we will set formula cell.f later
+  rows.forEach((r, i) => {
+    // create placeholder; temp at col C => 'C' + rowNumber
+    wsRows.push([i+1, r.timestamp, (isNaN(r.temp)?null: r.temp), (isNaN(r.hum)?null: r.hum), null, null, r.dynamicPortions, null]);
+  });
+  const ws = XLSX.utils.aoa_to_sheet(wsRows);
+
+  // set Utah formulas and cumulative formulas (sheet rows start at 1; header is row 1)
+  for (let i = 0; i < rows.length; i++){
+    const rnum = i + 2; // Excel row
+    const tempCell = `C${rnum}`;
+    // Utah per-row formula
+    const utahF = utahFormulaForCell(tempCell);
+    ws[`E${rnum}`] = {t:'n', f: utahF}; // put formula in column E
+
+    // Utah cumulative
+    ws[`F${rnum}`] = {t:'n', f: `=SUM(E$2:E${rnum})`};
+
+    // Dynamic per-row we already have number in column G (was set by aoa_to_sheet)
+    // Dynamic cumulative
+    ws[`H${rnum}`] = {t:'n', f: `=SUM(G$2:G${rnum})`};
+  }
+
+  // add notes sheet
+  const notes = [
+    ['Notes'],
+    ['- "Utah_CU" per-row is an Excel formula (editable).'],
+    ['- "Dynamic_CP_approx" per-row is computed by this web app (JS approximation of the Dynamic model).'],
+    ['- Dynamic model implemented here follows the two-step concept (intermediate product with optimum ~6°C, bank to portions).'],
+    ['Sources: Richardson (Utah model) and Fishman/Erez (Dynamic model). See README in repo for full references.']
+  ];
+  const wsNotes = XLSX.utils.aoa_to_sheet(notes);
+  XLSX.utils.book_append_sheet(wb, ws, 'data');
+  XLSX.utils.book_append_sheet(wb, wsNotes, 'notes');
+
+  const wbout = XLSX.write(wb, {bookType:'xlsx', type:'array'});
+  const blob = new Blob([wbout], {type:'application/octet-stream'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'arduino_chill_export.xlsx';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+connectBtn.addEventListener('click', async () => {
+  try {
+    if (!('serial' in navigator)) { alert('Web Serial API not supported in this browser. Use Chrome/Edge on desktop or Android.'); return; }
+    port = await navigator.serial.requestPort();
+    await port.open({baudRate: 9600});
+    statusEl.textContent = 'Status: connected';
+    connectBtn.disabled = true; disconnectBtn.disabled = false; exportBtn.disabled = false;
+
+    // send 'l' once
+    const writer = port.writable.getWriter();
+    await writer.write(new TextEncoder().encode('l'));
+    writer.releaseLock();
+    log('Sent: l (one-time)');
+
+    // start reading
+    const decoder = new TextDecoderStream();
+    inputDone = port.readable.pipeTo(decoder.writable);
+    reader = decoder.readable
+      .pipeThrough(new TransformStream(new LineBreakTransformer()))
+      .getReader();
+
+    keepReading = true;
+    readLoop();
+
+  } catch (err) {
+    console.error(err);
+    alert('Connect failed: ' + (err && err.message ? err.message : err));
+  }
+});
+
+disconnectBtn.addEventListener('click', async () => {
+  keepReading = false;
+  if (reader) { try { await reader.cancel(); } catch(e){} reader = null; }
+  if (port) {
+    try { await port.close(); } catch(e){}
+    port = null;
+  }
+  statusEl.textContent = 'Status: disconnected';
+  connectBtn.disabled = false; disconnectBtn.disabled = true;
+});
+
+exportBtn.addEventListener('click', exportXLSX);
+
+/* readLoop: read lines from the serial port */
+async function readLoop(){
+  statusEl.textContent = 'Status: reading';
+  try {
+    while (keepReading) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        // value is a single line (LineBreakTransformer used)
+        const line = value.trim();
+        if (!line) continue;
+        log('RX:', line);
+        const parsed = parseLine(line);
+        // run dynamic model step
+        const dyn = dynamicStep(parsed.temp);
+        const row = {
+          timestamp: parsed.timestamp,
+          temp: parsed.temp,
+          hum: parsed.hum,
+          dynamicPortions: dyn.portions
+        };
+        rows.push(row);
+        addRowToTable(row);
+      }
+    }
+  } catch (err) {
+    console.error(err);
+    log('Read error: ' + err);
+  }
+}
+
+/* LineBreakTransformer - turns stream chunks into lines */
+class LineBreakTransformer {
+  constructor(){
+    this.container = '';
+  }
+  transform(chunk, controller){
+    this.container += chunk;
+    const lines = this.container.split(/\r\n|\n/);
+    this.container = lines.pop();
+    for (const l of lines) controller.enqueue(l);
+  }
+  flush(controller){
+    if (this.container) controller.enqueue(this.container);
+  }
+}
+</script>
+</body>
+</html>
